@@ -7,6 +7,10 @@
 
 //! Helper for loading a kernel image in the guest memory.
 
+extern crate rand;
+use rand::thread_rng;
+use rand::Rng;
+
 use std::ffi::CString;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
@@ -62,6 +66,18 @@ impl fmt::Display for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+// DJW: this is simplified from what linux does but experimentally should work
+pub fn rand_phys(img_size:u64, minimum:u64,
+                 maximum:u64, align:u64)->std::io::Result<u64> {
+    let asize = (img_size + (align - 1)) - ((img_size + align - 1) % align);
+    let slots:u64 = (maximum - minimum - asize) / align + 1;
+    let randslot:u64 = thread_rng().gen_range(0, slots);
+    println!("DJW: phys randslot is {}/{}", randslot, slots);
+    
+    Ok(randslot * align)
+}
+
+
 /// Loads a kernel from a vmlinux elf image to a slice
 ///
 /// # Arguments
@@ -81,6 +97,14 @@ where
     F: Read + Seek,
 {
     let mut ehdr: elf::Elf64_Ehdr = Default::default();
+
+    kernel_image.seek(SeekFrom::Start(0))
+        .expect("DJW: couldn't seek for kernel size");
+    let phys_offset = rand_phys(kernel_image.seek(SeekFrom::End(0)).unwrap(),
+                                start_address,
+                                guest_mem.last_addr().raw_value(),
+                                0x1000000).unwrap();
+
     kernel_image
         .seek(SeekFrom::Start(0))
         .map_err(|_| Error::SeekKernelImage)?;
@@ -131,7 +155,7 @@ where
             .seek(SeekFrom::Start(phdr.p_offset))
             .map_err(|_| Error::SeekKernelStart)?;
 
-        let mem_offset = GuestAddress(phdr.p_paddr);
+        let mem_offset = GuestAddress(phdr.p_paddr + phys_offset);
         if mem_offset.raw_value() < start_address {
             return Err(Error::InvalidProgramHeaderAddress);
         }
