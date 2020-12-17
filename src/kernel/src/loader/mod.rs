@@ -88,7 +88,7 @@ fn handle_relocations(guest_mem: &GuestMemoryMmap,
     // this comes from __START_KERNEL_map in the Linux guest
     let kernel_vaddr_start = 0x80000000u32;
     
-    let filename = "/home/djwillia/pvhrando-scripts/fcguest3.vmlinux.relocs";
+    let filename = "/tmp/vmlinux.relocs";
     let mut f = File::open(filename)?;
     let mut contents = Vec::new();
     f.read_to_end(&mut contents)?;
