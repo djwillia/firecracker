@@ -7,6 +7,12 @@
 
 //! Helper for loading a kernel image in the guest memory.
 
+extern crate rand;
+use rand::thread_rng;
+use rand::Rng;
+use std::fs::File;
+use std::convert::TryInto;
+    
 use std::ffi::CString;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
@@ -62,6 +68,96 @@ impl fmt::Display for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+// DJW: this is caclulated the same as in arch/x86/boot/compressed/kaslr.c
+// phys is simplified from what linux does but experimentally should work
+pub fn rand_addr(img_size:u64, minimum:u64,
+                 maximum:u64, align:u64)->std::io::Result<u64> {
+    let asize = (img_size + (align - 1)) - ((img_size + align - 1) % align);
+    let slots:u64 = (maximum - minimum - asize) / align + 1;
+    let randslot:u64 = thread_rng().gen_range(0, slots);
+    println!("DJW: randslot is {}/{}", randslot, slots);
+    
+    Ok((randslot * align) + minimum)
+}
+
+// do relocs for the virtual offset
+fn handle_relocations(guest_mem: &GuestMemoryMmap,
+                      virt_offset:u32,
+                      phys_offset:u32)->std::io::Result<()> {
+    
+    // this comes from __START_KERNEL_map in the Linux guest
+    let kernel_vaddr_start = 0x80000000u32;
+    
+    let filename = "/tmp/vmlinux.relocs";
+    let mut f = File::open(filename)?;
+    let mut contents = Vec::new();
+    f.read_to_end(&mut contents)?;
+    
+    let mut p = contents.len() - 4;
+    
+    // 32-bit relocations
+    loop {
+        let addr:u32 = u32::from_le_bytes(contents[p..(p+4)]
+                                          .try_into().unwrap());
+        p -= 4;
+        if addr != 0 {
+            let addr_off = addr - kernel_vaddr_start + phys_offset;
+            let guest_addr = GuestAddress(addr_off.into());
+            let reloc_buf = &mut [0u8; 4];
+            guest_mem.read_slice(reloc_buf, guest_addr)
+                .expect("Can't read 32-bit reloc");
+            let reloc_addr = u32::from_le_bytes(*reloc_buf)
+                + virt_offset as u32;
+            guest_mem.write(&reloc_addr.to_le_bytes(), guest_addr)
+                .expect("Can't write 32-bit reloc");
+        } else {
+            break;
+        }
+    }
+    // 32-bit inverse relocations
+    loop {
+        let addr:u32 = u32::from_le_bytes(contents[p..(p+4)]
+                                          .try_into().unwrap());
+        p -= 4;
+        if addr != 0 {
+            let addr_off = addr - kernel_vaddr_start + phys_offset;
+            let guest_addr = GuestAddress(addr_off.into());
+            let reloc_buf = &mut [0u8; 4];
+            guest_mem.read_slice(reloc_buf, guest_addr)
+                .expect("Can't read 32-bit inv reloc");
+            let reloc_addr = u32::from_le_bytes(*reloc_buf)
+                - virt_offset as u32;
+            guest_mem.write(&reloc_addr.to_le_bytes(), guest_addr)
+                .expect("Can't write 32-bit inv reloc");
+        } else {
+            break;
+        }
+    }
+
+    // 64-bit relocations
+    loop {
+        let addr:u32 = u32::from_le_bytes(contents[p..(p+4)]
+                                          .try_into().unwrap());
+        if addr != 0 {
+            let addr_off = addr - kernel_vaddr_start + phys_offset;
+            let guest_addr = GuestAddress(addr_off.into());
+            let reloc_buf = &mut [0u8; 8];
+            guest_mem.read_slice(reloc_buf, guest_addr)
+                .expect("Can't read 64-bit reloc");
+            let reloc_addr = u64::from_le_bytes(*reloc_buf)
+                + virt_offset as u64;
+            guest_mem.write(&reloc_addr.to_le_bytes(), guest_addr)
+                .expect("Can't write 64-bit reloc");
+        } else {
+            break;
+        }
+        p -= 4;
+    }
+    assert!(p == 0);
+    Ok(())
+}
+
+
 /// Loads a kernel from a vmlinux elf image to a slice
 ///
 /// # Arguments
@@ -81,6 +177,20 @@ where
     F: Read + Seek,
 {
     let mut ehdr: elf::Elf64_Ehdr = Default::default();
+
+    kernel_image.seek(SeekFrom::Start(0))
+        .expect("DJW: couldn't seek for kernel size");
+    let img_size = kernel_image.seek(SeekFrom::End(0)).unwrap();
+    let phys_addr = rand_addr(img_size,
+                              0x1000000,
+                              guest_mem.last_addr().raw_value(),
+                              0x1000000).unwrap();
+    let virt_offset = rand_addr(img_size,
+                                0x1000000,
+                                1024 * 1024 * 1024,
+                                0x200000).unwrap();
+    let phys_offset = phys_addr - 0x1000000;
+    
     kernel_image
         .seek(SeekFrom::Start(0))
         .map_err(|_| Error::SeekKernelImage)?;
@@ -131,7 +241,7 @@ where
             .seek(SeekFrom::Start(phdr.p_offset))
             .map_err(|_| Error::SeekKernelStart)?;
 
-        let mem_offset = GuestAddress(phdr.p_paddr);
+        let mem_offset = GuestAddress(phdr.p_paddr + phys_offset);
         if mem_offset.raw_value() < start_address {
             return Err(Error::InvalidProgramHeaderAddress);
         }
@@ -141,6 +251,11 @@ where
             .map_err(|_| Error::ReadKernelImage)?;
     }
 
+    handle_relocations(guest_mem,
+                       virt_offset.try_into().unwrap(),
+                       phys_offset.try_into().unwrap())
+        .expect("Couldn't handle relocs");
+    
     Ok(GuestAddress(ehdr.e_entry))
 }
 
